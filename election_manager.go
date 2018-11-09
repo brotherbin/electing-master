@@ -1,10 +1,11 @@
-package main
+package electing_master
 
 import (
-	"github.com/samuel/go-zookeeper/zk"
 	"errors"
+	"github.com/samuel/go-zookeeper/zk"
+	"log"
+	"strings"
 	"time"
-	"fmt"
 )
 
 type ZookeeperConfig struct {
@@ -19,22 +20,48 @@ type ElectionManager struct {
 	IsMasterQ    chan bool
 }
 
-func NewElectionManager(zkConfig *ZookeeperConfig, isMasterQ chan bool) *ElectionManager {
+const (
+	DefaultRootPath   = "/GOLANG_ELECTING_MASTER"
+	DefaultMasterPath = "/MASTER"
+)
+
+// zkAddr format: {ip1}:{port1},{ip2}:{port2},{ip3}:{port3}/{rootPath}, and the rootPath is the optional field
+// zkAddr eg1: 127.0.0.1
+// zkAddr eg2: 127.0.0.1:2080,127.0.0.1:2081,127.0.0.1:2082
+// zkAddr eg3: 127.0.0.1:2080,127.0.0.1:2081,127.0.0.1:2082/__ELECTING_MASTER__
+func GoElectingMaster(zkAddr string, isMasterQ chan bool) error {
+	zkConf := &ZookeeperConfig{
+		RootPath:   DefaultRootPath,
+		MasterPath: DefaultMasterPath,
+	}
+	if zkAddr == "" {
+		return errors.New("empty zookeeper address.")
+	}
+	var serversStr, pathStr string
+	if strings.Contains(zkAddr, "/") {
+		sp := strings.Split(zkAddr, "/")
+		serversStr, pathStr = sp[0], sp[1]
+	} else {
+		serversStr = zkAddr
+	}
+	if pathStr != "" {
+		zkConf.RootPath = "/" + pathStr
+	}
+	if strings.Contains(serversStr, ",") {
+		zkConf.Servers = strings.Split(serversStr, ",")
+	} else {
+		zkConf.Servers = []string{serversStr}
+	}
 	electionManager := &ElectionManager{
 		nil,
-		zkConfig,
+		zkConf,
 		isMasterQ,
 	}
-	electionManager.initConnection()
-	return electionManager
-}
-
-func (electionManager *ElectionManager) Run() {
-	err := electionManager.electMaster()
-	if err != nil {
-		fmt.Println("elect master error, ", err)
+	if err := electionManager.electMaster(); err != nil {
+		return err
 	}
-	electionManager.watchMaster()
+	go electionManager.WatchMaster()
+	return nil
 }
 
 // 判断是否成功连接到zookeeper
@@ -62,7 +89,7 @@ func (electionManager *ElectionManager) initConnection() error {
 			case connEvent := <-connChan:
 				if connEvent.State == zk.StateConnected {
 					isConnected = true
-					fmt.Println("connect to zookeeper server success!")
+					log.Println("connect to zookeeper server success!")
 				}
 			case _ = <-time.After(time.Second * 3): // 3秒仍未连接成功则返回连接超时
 				return errors.New("connect to zookeeper server timeout!")
@@ -102,36 +129,36 @@ func (electionManager *ElectionManager) electMaster() error {
 	path, err := electionManager.ZKClientConn.Create(masterPath, nil, zk.FlagEphemeral, zk.WorldACL(zk.PermAll))
 	if err == nil { // 创建成功表示选举master成功
 		if path == masterPath {
-			fmt.Println("elect master success!")
+			log.Println("elect master success!")
 			electionManager.IsMasterQ <- true
 		} else {
 			return errors.New("Create returned different path " + masterPath + " != " + path)
 		}
 	} else { // 创建失败表示选举master失败
-		fmt.Printf("elect master failure, ", err)
+		log.Printf("elect master failure: %s", err)
 		electionManager.IsMasterQ <- false
 	}
 	return nil
 }
 
 // 监听zookeeper中master znode，若被删除，表示master故障或网络迟缓，重新选举
-func (electionManager *ElectionManager) watchMaster() {
+func (electionManager *ElectionManager) WatchMaster() {
 	// watch zk根znode下面的子znode，当有连接断开时，对应znode被删除，触发事件后重新选举
 	children, state, childCh, err := electionManager.ZKClientConn.ChildrenW(electionManager.ZKConfig.RootPath + electionManager.ZKConfig.MasterPath)
 	if err != nil {
-		fmt.Println("watch children error, ", err)
+		log.Printf("watch children error: %s", err)
 	}
-	fmt.Println("watch children result, ", children, state)
+	log.Printf("watch children result. children=%s, state=%v", children, state)
 	for {
 		select {
 		case childEvent := <-childCh:
 			if childEvent.Type == zk.EventNodeDeleted {
-				fmt.Println("receive znode delete event, ", childEvent)
+				log.Printf("receive znode delete event: %v", childEvent)
 				// 重新选举
-				fmt.Println("start elect new master ...")
+				log.Println("start electing new master ...")
 				err = electionManager.electMaster()
 				if err != nil {
-					fmt.Println("elect new master error, ", err)
+					log.Printf("elect new master error: %s", err)
 				}
 			}
 		}
